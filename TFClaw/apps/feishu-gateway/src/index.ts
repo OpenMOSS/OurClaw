@@ -3495,7 +3495,7 @@ class OpenClawPerUserBridge {
     feishuTools.wiki = true;
     feishuTools.drive = true;
     feishuTools.scopes = true;
-    feishuTools.perm = false;
+    feishuTools.perm = true;
     feishuTools.chat = true;
     feishu.tools = feishuTools;
     delete feishu.accounts;

@@ -10,5 +10,10 @@
         }
       }
     ]
+  },
+  "plugins": {
+    "allow": [
+      "feishu"
+    ]
   }
 }

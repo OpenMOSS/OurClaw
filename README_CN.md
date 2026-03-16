@@ -73,6 +73,8 @@ bash installopenclaw.sh
 
 - [`commonworkspace/openclaw.json`](./commonworkspace/openclaw.json)
 
+注：为防止飞书插件因`~/.openclaw/openclaw.json` 中无相关配置而无权限使用，我们在 `commonworkspace/openclaw.json` 里增加了 `plugins.allow:['feishu']`
+
 #### 2.3. 实际生成位置
 
 每个用户最终运行时使用的配置文件会生成到：
@@ -102,6 +104,7 @@ bash installTFClaw.sh
 - `relay.url`
 - `openclawBridge.enabled`
 - `openclawBridge.openclawRoot`
+- `openclawBridge.nodePath`  nodejs路径
 - `openclawBridge.sharedSkillsDir`  公用skills路径
 - `openclawBridge.sharedEnvPath`    公用环境变量路径
 - `openclawBridge.userHomeRoot`
