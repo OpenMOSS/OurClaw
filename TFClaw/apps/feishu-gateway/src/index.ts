@@ -6851,6 +6851,7 @@ class TfclawCommandRouter {
   private progressSessions = new Map<string, TerminalProgressSession>();
   private commandProgressSessions = new Map<string, CommandProgressSession>();
   private activeCommandRequestBySelection = new Map<string, string>();
+  private inboundMessageQueues = new Map<string, Promise<void>>();
   private readonly progressPollMs = 1200;
   private readonly groupObservedUserTtlMs = 24 * 60 * 60 * 1000;
   private readonly groupObservedUserMax = 256;
@@ -8154,6 +8155,26 @@ class TfclawCommandRouter {
       workspaceOverrideDir: route.workspaceOverrideDir,
       modeLabel: route.modeLabel,
     };
+  }
+
+  private async enqueueInboundMessageBySelection(
+    selectionKey: string,
+    task: () => Promise<void>,
+  ): Promise<void> {
+    const previous = this.inboundMessageQueues.get(selectionKey) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        await task();
+      });
+    this.inboundMessageQueues.set(selectionKey, current);
+    try {
+      await current;
+    } finally {
+      if (this.inboundMessageQueues.get(selectionKey) === current) {
+        this.inboundMessageQueues.delete(selectionKey);
+      }
+    }
   }
 
   private async handleAccessControlCommand(
@@ -9499,6 +9520,17 @@ class TfclawCommandRouter {
     }
 
     const userScope = await this.resolveUserScope(ctx);
+    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId, userScope.userKey);
+    await this.enqueueInboundMessageBySelection(selectionKey, async () => {
+      await this.handleInboundMessageWithScope(ctx, userScope, selectionKey);
+    });
+  }
+
+  private async handleInboundMessageWithScope(
+    ctx: InboundTextContext,
+    userScope: RouterUserScope,
+    selectionKey: string,
+  ): Promise<void> {
     await this.accessManager.registerUserAliases(userScope.userKey, [
       ctx.senderOpenId || "",
       ctx.senderUserId || "",
@@ -9520,7 +9552,6 @@ class TfclawCommandRouter {
       await this.accessManager.registerUserDisplayName(mentionUserKey, mention.name || "");
     }
     this.registerObservedGroupParticipants(ctx, userScope);
-    const selectionKey = this.selectionKey(ctx.channel, ctx.chatId, userScope.userKey);
     const isGroupChat = this.isGroupChat(ctx);
     const isTmuxMode = this.isTmuxMode(selectionKey);
     let text = ctx.text.replace(/\r/g, "").trim();
