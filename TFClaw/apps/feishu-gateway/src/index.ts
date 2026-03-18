@@ -1698,6 +1698,7 @@ class OpenClawPerUserBridge {
   private readonly openclawEntryPath: string;
 
   private readonly gatewayOperatorIdentityByCacheKey = new Map<string, OpenClawGatewayOperatorIdentity>();
+  private readonly chatSendExtendedParamsSupportByCacheKey = new Map<string, boolean>();
   private readonly distEntryCandidates: string[];
 
   private mapLock: Promise<void> = Promise.resolve();
@@ -4913,29 +4914,60 @@ class OpenClawPerUserBridge {
   }
 
   private buildPermissionDeniedReply(...values: unknown[]): string | undefined {
+    const extractTexts = (value: unknown, depth = 0): string[] => {
+      if (depth > 2 || value === null || value === undefined) {
+        return [];
+      }
+      if (typeof value === "string") {
+        const normalized = value.trim();
+        return normalized ? [normalized] : [];
+      }
+      if (Array.isArray(value)) {
+        return value.flatMap((item) => extractTexts(item, depth + 1));
+      }
+      if (typeof value !== "object") {
+        return [];
+      }
+      const obj = toObject(value);
+      const directFields = [
+        "message",
+        "errorMessage",
+        "error",
+        "msg",
+        "summary",
+        "reason",
+        "detail",
+      ].map((key) => toString(obj[key]).trim()).filter(Boolean);
+      const nestedFields = [
+        obj.error,
+        obj.payload,
+        obj.data,
+        obj.response,
+        obj.result,
+      ].flatMap((item) => extractTexts(item, depth + 1));
+      return [...directFields, ...nestedFields];
+    };
     const raw = values
-      .map((value) => {
-        if (typeof value === "string") {
-          return value;
-        }
-        try {
-          return JSON.stringify(value);
-        } catch {
-          return "";
-        }
-      })
+      .flatMap((value) => extractTexts(value))
       .filter(Boolean)
       .join("\n");
+    if (!raw) {
+      return undefined;
+    }
     const lowered = raw.toLowerCase();
     if (
       lowered.includes("permission denied")
       || lowered.includes("no permission")
       || lowered.includes("forbidden")
       || lowered.includes("unauthorized")
+      || lowered.includes("no user authority")
+      || lowered.includes("missing scope")
       || raw.includes("没有权限")
       || raw.includes("无权限")
       || raw.includes("权限不足")
     ) {
+      const snippet = raw.replace(/\s+/g, " ").slice(0, 240);
+      console.warn(`[gateway] openclaw permission-denied normalized: ${JSON.stringify(snippet)}`);
       return "操作失败：没有相关权限。请检查当前账号或应用是否具备所需权限。";
     }
     return undefined;
@@ -4984,6 +5016,9 @@ class OpenClawPerUserBridge {
         mode: "backend",
       } as const;
       const connectIdentityCacheKey = `${params.gatewayUrl}|${params.gatewayToken}`;
+      const hasRequestedExtendedParams = Boolean(params.messageChannel?.trim() || params.requesterSenderId?.trim());
+      const extendedParamsSupported = this.chatSendExtendedParamsSupportByCacheKey.get(connectIdentityCacheKey) !== false;
+      const shouldSendExtendedParams = hasRequestedExtendedParams && extendedParamsSupported;
       let closed = false;
       let connectSent = false;
       let runId = "";
@@ -5125,12 +5160,12 @@ class OpenClawPerUserBridge {
               params: {
                 sessionKey: params.sessionKey,
                 message: params.message,
-                messageChannel: params.messageChannel?.trim() || undefined,
+                messageChannel: shouldSendExtendedParams ? (params.messageChannel?.trim() || undefined) : undefined,
                 deliver: false,
                 attachments: params.attachments?.length ? params.attachments : undefined,
                 timeoutMs: this.config.requestTimeoutMs,
                 idempotencyKey: `tfclaw-openclaw-${randomId()}`,
-                requesterSenderId: params.requesterSenderId?.trim() || undefined,
+                requesterSenderId: shouldSendExtendedParams ? (params.requesterSenderId?.trim() || undefined) : undefined,
               },
             };
             ws.send(JSON.stringify(chatFrame));
@@ -5140,8 +5175,9 @@ class OpenClawPerUserBridge {
           if (id === chatReqId) {
             if (!ok) {
               const frameError = this.formatFrameError(frame);
-              const hasExtendedParams = Boolean(params.messageChannel?.trim() || params.requesterSenderId?.trim());
+              const hasExtendedParams = shouldSendExtendedParams;
               if (hasExtendedParams && this.isUnsupportedChatSendParamError(frameError)) {
+                this.chatSendExtendedParamsSupportByCacheKey.set(connectIdentityCacheKey, false);
                 console.warn(
                   "[gateway] openclaw chat.send compatibility fallback: retry without messageChannel/requesterSenderId",
                 );
@@ -5159,6 +5195,9 @@ class OpenClawPerUserBridge {
             const payload = toObject(frame.payload);
             const status = toString(payload.status).trim().toLowerCase();
             const payloadRunId = toString(payload.runId).trim();
+            if (shouldSendExtendedParams) {
+              this.chatSendExtendedParamsSupportByCacheKey.set(connectIdentityCacheKey, true);
+            }
             if (payloadRunId) {
               runId = payloadRunId;
             }
