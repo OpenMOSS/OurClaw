@@ -120,6 +120,46 @@ bash installTFClaw.sh
 - 用户 home 根目录：`TFClaw/.home`
 - OpenClaw bridge 状态目录：`TFClaw/.runtime/openclaw_bridge`
 
+### 5. 启用 inspire-cpu 后端模式（可选）
+
+默认模式是 `local`（本地按用户 tmux 启动 OpenClaw）。如果你希望按用户/群聊分配到 Inspire CPU 实例，请在 [`TFClaw/config.json`](./TFClaw/config.json) 的 `openclawBridge` 中设置：
+
+```json
+"runtimeBackend": "inspire-cpu"
+```
+
+并补充这些关键字段（按你的环境填写）：
+
+- `inspireCliCommand`（例如 `inspire` 或完整命令）
+- `inspireCliModuleDir`
+- `inspireBaseUrl`
+- `inspireUsername`
+- `inspirePasswordEnvKey`（默认 `INSPIRE_PASSWORD`）
+- `inspireNotebookResource`（默认 `4CPU`）
+- `inspireNotebookProject`
+- `inspireNotebookImage`
+- `inspireOpenclawRoot`（远端实例里的 OpenClaw 路径）
+- `inspireRemoteRuntimeDir`
+- `inspireRemoteWorkspaceDir`
+
+启动前导出密码环境变量（不要把密码写进配置文件）：
+
+```bash
+export INSPIRE_PASSWORD='your-password'
+```
+
+然后在仓库根目录执行：
+
+```bash
+./restart_tfclaw_and_openclaw_users.sh
+```
+
+说明：
+
+- `runtimeBackend=inspire-cpu` 时，重启脚本会跳过本地 mapped-user OpenClaw 重启段。
+- 首次收到某个用户/群聊消息时，会自动创建/复用对应 Inspire notebook 并拉起 OpenClaw，首轮可能比本地模式更慢。
+- 你可以在 gateway 日志里看到 `backend=inspire-cpu` 来确认模式生效。
+
 ## 启动整套服务
 
 在仓库根目录执行：

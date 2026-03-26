@@ -121,6 +121,46 @@ Current defaults in this repository point to:
 - User home root: `TFClaw/.home`
 - OpenClaw bridge state directory: `TFClaw/.runtime/openclaw_bridge`
 
+### 5. Enable inspire-cpu Backend Mode (Optional)
+
+Default mode is `local` (per-user local tmux OpenClaw). If you want per-user/per-group routing to Inspire CPU instances, set this in [`TFClaw/config.json`](./TFClaw/config.json):
+
+```json
+"runtimeBackend": "inspire-cpu"
+```
+
+Then configure these fields for your environment:
+
+- `inspireCliCommand` (for example `inspire` or a full command)
+- `inspireCliModuleDir`
+- `inspireBaseUrl`
+- `inspireUsername`
+- `inspirePasswordEnvKey` (default: `INSPIRE_PASSWORD`)
+- `inspireNotebookResource` (default: `4CPU`)
+- `inspireNotebookProject`
+- `inspireNotebookImage`
+- `inspireOpenclawRoot` (OpenClaw path inside the remote instance)
+- `inspireRemoteRuntimeDir`
+- `inspireRemoteWorkspaceDir`
+
+Export password via env var before startup (do not write plaintext password into config):
+
+```bash
+export INSPIRE_PASSWORD='your-password'
+```
+
+Then run from repository root:
+
+```bash
+./restart_tfclaw_and_openclaw_users.sh
+```
+
+Notes:
+
+- When `runtimeBackend=inspire-cpu`, the restart script skips the local mapped-user OpenClaw restart stage.
+- On the first message for a user/group, gateway will create/reuse the mapped Inspire notebook and start OpenClaw in it, so first response may be slower than local mode.
+- Check gateway logs for `backend=inspire-cpu` to confirm the mode is active.
+
 ## Start the Full Stack
 
 Run this in the repository root:

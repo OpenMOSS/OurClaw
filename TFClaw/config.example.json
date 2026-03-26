@@ -32,7 +32,7 @@
     "inspireNotebookImage": "",
     "inspireNotebookProject": "",
     "inspireBridgeProfilePrefix": "tfclaw-openclaw",
-    "inspireOpenclawRoot": "/inspire/qb-ilm/project/cq-scientific-cooperation-zone/ky26016/WeClaw/openclaw",
+    "inspireOpenclawRoot": "/path/to/WeClaw/openclaw",
     "inspireRemoteRuntimeDir": "~/.tfclaw-openclaw",
     "inspireRemoteWorkspaceDir": "~/.tfclaw-openclaw/workspace"
   },
