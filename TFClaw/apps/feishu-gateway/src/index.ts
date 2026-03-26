@@ -127,6 +127,7 @@ interface NexChatBotConfig {
 
 interface OpenClawBridgeConfig {
   enabled: boolean;
+  runtimeBackend: "local" | "inspire-cpu";
   openclawRoot: string;
   stateDir: string;
   sharedEnvPath: string;
@@ -149,6 +150,19 @@ interface OpenClawBridgeConfig {
   feishuVerificationToken: string;
   feishuEncryptKey: string;
   feishuWebhookPortOffset: number;
+  inspireCliCommand: string;
+  inspireCliModuleDir: string;
+  inspireBaseUrl: string;
+  inspireUsername: string;
+  inspirePasswordEnvKey: string;
+  inspireNotebookNamePrefix: string;
+  inspireNotebookResource: string;
+  inspireNotebookImage: string;
+  inspireNotebookProject: string;
+  inspireBridgeProfilePrefix: string;
+  inspireOpenclawRoot: string;
+  inspireRemoteRuntimeDir: string;
+  inspireRemoteWorkspaceDir: string;
 }
 
 interface GatewayConfig {
@@ -668,6 +682,42 @@ function toStringArray(value: unknown, fallback: string[] = []): string[] {
     return parseCsv(value);
   }
   return fallback;
+}
+
+function tryParseLastJsonObject(text: string): Record<string, unknown> | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i] ?? "";
+    if (!line.startsWith("{") || !line.endsWith("}")) {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      continue;
+    }
+  }
+  const first = trimmed.indexOf("{");
+  const last = trimmed.lastIndexOf("}");
+  if (first < 0 || last <= first) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(trimmed.slice(first, last + 1));
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function normalizeLeadingCommandSlash(text: string): string {
@@ -1569,6 +1619,9 @@ interface OpenClawUserBinding {
   gatewayToken: string;
   createdAt: string;
   updatedAt: string;
+  runtimeBackend?: "local" | "inspire-cpu";
+  inspireNotebookId?: string;
+  inspireBridgeProfile?: string;
 }
 
 interface OpenClawUserMapFile {
@@ -1621,6 +1674,8 @@ const OPENCLAW_BRIDGE_ENV_VALUE_MAX_LENGTH = 16 * 1024;
 const OPENCLAW_BRIDGE_INBOUND_MAX_FILE_BYTES = 30 * 1024 * 1024;
 const OPENCLAW_BRIDGE_OUTBOUND_MAX_FILE_BYTES = 30 * 1024 * 1024;
 const OPENCLAW_BRIDGE_MEDIA_FETCH_TIMEOUT_MS = 20_000;
+const OPENCLAW_BRIDGE_INSPIRE_CHAT_CLIENT_FILENAME = "gateway-chat-client.js";
+const OPENCLAW_BRIDGE_INSPIRE_REMOTE_CONFIG_FILENAME = "openclaw.remote.json";
 const FEISHU_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const FEISHU_MAX_FILE_BYTES = 30 * 1024 * 1024;
 const FEISHU_TEXT_CHUNK_LIMIT = 4000;
@@ -1693,6 +1748,7 @@ const OPENCLAW_BUILTIN_SLASH_COMMANDS = new Set([
 
 class OpenClawPerUserBridge {
   readonly enabled: boolean;
+  private readonly isInspireCpuBackend: boolean;
 
   private readonly mapFilePath: string;
   private readonly openclawEntryPath: string;
@@ -1704,6 +1760,7 @@ class OpenClawPerUserBridge {
   private mapLock: Promise<void> = Promise.resolve();
   private runAsModePromise: Promise<"runuser" | "sudo" | "su"> | undefined;
   private distChecked = false;
+  private inspireInitReady = false;
 
   constructor(private readonly config: OpenClawBridgeConfig) {
     const root = path.resolve(config.openclawRoot || ".");
@@ -1715,6 +1772,8 @@ class OpenClawPerUserBridge {
     this.config.sharedEnvPath = sharedEnvPath;
     this.config.userHomeRoot = userHomeRoot;
     this.enabled = config.enabled && root.trim().length > 0;
+    this.config.runtimeBackend = this.config.runtimeBackend === "inspire-cpu" ? "inspire-cpu" : "local";
+    this.isInspireCpuBackend = this.config.runtimeBackend === "inspire-cpu";
     this.mapFilePath = path.join(stateDir, "feishu-user-map.json");
     this.openclawEntryPath = path.join(root, "openclaw.mjs");
     this.distEntryCandidates = [
@@ -1732,11 +1791,17 @@ class OpenClawPerUserBridge {
     }
 
     await this.ensureOpenClawEntry();
-    const binding = await this.ensureUserBinding(request);
+    let binding = await this.ensureUserBinding(request);
     const runtime = this.prepareUserRuntime(binding, request.workspaceOverrideDir);
-    await this.ensureTmuxOpenClawProcess(binding, runtime);
+    if (this.isInspireCpuBackend) {
+      binding = await this.ensureInspireNotebookOpenClawProcess(binding, runtime);
+    } else {
+      await this.ensureTmuxOpenClawProcess(binding, runtime);
+    }
 
-    const attachmentContext = this.stageInboundAttachments(binding, runtime, request.attachments ?? []);
+    const attachmentContext = this.isInspireCpuBackend
+      ? this.stageInboundAttachmentsForInspire(request.attachments ?? [])
+      : this.stageInboundAttachments(binding, runtime, request.attachments ?? []);
     const channel = (request.channel || "").trim().toLowerCase();
     const slashCommand = this.resolveBuiltinSlashCommand(request.text);
     const prompt = (() => {
@@ -1752,24 +1817,32 @@ class OpenClawPerUserBridge {
       );
     })();
     const gatewaySessionKey = this.resolveGatewaySessionKey(request);
-    const runStartedAtMs = Date.now();
     const gatewayUrl = `ws://${this.config.gatewayHost}:${binding.gatewayPort}`;
+    const runStartedAtMs = Date.now();
     const userTempMediaRoot = this.resolveUserTempMediaRoot(binding.account.uid);
     const extraLocalMediaRoots = userTempMediaRoot ? [userTempMediaRoot] : [];
-    let reply = await this.callGatewayChat({
-      gatewayUrl,
-      gatewayToken: binding.gatewayToken,
-      sessionKey: gatewaySessionKey,
-      message: prompt,
-      messageChannel: channel || undefined,
-      attachments: attachmentContext.gatewayAttachments,
-      workspaceDir: runtime.workspaceDir,
-      homeDir: binding.account.home,
-      extraLocalMediaRoots,
-      requesterSenderId: request.requesterSenderId,
-      onDeltaText: streamCallbacks?.onDeltaText,
-      allowEmptyMediaPlaceholderFallback: Boolean(request.allowEmptyMediaPlaceholderFallback),
-    });
+    let reply = this.isInspireCpuBackend
+      ? await this.callGatewayChatViaInspireBridge({
+          binding,
+          sessionKey: gatewaySessionKey,
+          message: prompt,
+          messageChannel: channel || undefined,
+          requesterSenderId: request.requesterSenderId,
+        })
+      : await this.callGatewayChat({
+          gatewayUrl: `ws://${this.config.gatewayHost}:${binding.gatewayPort}`,
+          gatewayToken: binding.gatewayToken,
+          sessionKey: gatewaySessionKey,
+          message: prompt,
+          messageChannel: channel || undefined,
+          attachments: attachmentContext.gatewayAttachments,
+          workspaceDir: runtime.workspaceDir,
+          homeDir: binding.account.home,
+          extraLocalMediaRoots,
+          requesterSenderId: request.requesterSenderId,
+          onDeltaText: streamCallbacks?.onDeltaText,
+          allowEmptyMediaPlaceholderFallback: Boolean(request.allowEmptyMediaPlaceholderFallback),
+        });
     const voiceRequested = this.hasVoiceReplyIntent(request.text);
     const normalizedReplyText = reply.text.trim();
     const attachmentOnlyReply = this.isAttachmentOnlyText(reply.text);
@@ -1817,7 +1890,7 @@ class OpenClawPerUserBridge {
       )
     ) {
       const voiceTextFallback = await this.generateVoiceTextFallbackFromGateway(
-        gatewayUrl,
+        this.isInspireCpuBackend ? "" : gatewayUrl,
         binding.gatewayToken,
         gatewaySessionKey,
         request.text,
@@ -2356,11 +2429,966 @@ class OpenClawPerUserBridge {
     }
     sections.push(
       [
-        "[系统提示] 已接收用户上传的附件（已保存到当前用户工作区，可直接读取）：",
+        "[系统提示] 已接收用户上传的附件（可用于当前请求）：",
         ...context.promptLines,
       ].join("\n"),
     );
     return sections.join("\n\n").trim();
+  }
+
+  private resolveInspireCliCommand(): string {
+    const raw = toString(this.config.inspireCliCommand, "").trim();
+    if (raw) {
+      return raw;
+    }
+    return "inspire";
+  }
+
+  private resolveInspireCliWorkingDir(): string | undefined {
+    const raw = toString(this.config.inspireCliModuleDir, "").trim();
+    if (!raw) {
+      return undefined;
+    }
+    const resolved = path.resolve(raw);
+    return fs.existsSync(resolved) ? resolved : undefined;
+  }
+
+  private buildInspireCliEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+    };
+    delete env.http_proxy;
+    delete env.https_proxy;
+    delete env.HTTP_PROXY;
+    delete env.HTTPS_PROXY;
+    delete env.ALL_PROXY;
+    delete env.all_proxy;
+    delete env.NO_PROXY;
+    delete env.no_proxy;
+    delete env.npm_config_proxy;
+    delete env.npm_config_https_proxy;
+    delete env.npm_config_http_proxy;
+    delete env.npm_config_noproxy;
+
+    const configuredUsername = toString(this.config.inspireUsername, "").trim();
+    if (configuredUsername) {
+      env.INSPIRE_USERNAME = configuredUsername;
+    }
+    const configuredBaseUrl = toString(this.config.inspireBaseUrl, "").trim();
+    if (configuredBaseUrl) {
+      env.INSPIRE_BASE_URL = configuredBaseUrl;
+    }
+    const passwordEnvKey = toString(this.config.inspirePasswordEnvKey, "").trim();
+    if (passwordEnvKey) {
+      const passwordValue = toString(process.env[passwordEnvKey], "").trim();
+      if (passwordValue) {
+        env.INSPIRE_PASSWORD = passwordValue;
+      }
+    }
+    const resolvedBridgeAccount = toString(env.INSPIRE_USERNAME, "").trim();
+    if (resolvedBridgeAccount && !toString(env.INSPIRE_BRIDGE_ACCOUNT, "").trim()) {
+      env.INSPIRE_BRIDGE_ACCOUNT = resolvedBridgeAccount;
+    }
+    return env;
+  }
+
+  private async ensureInspireBackendReady(): Promise<void> {
+    if (this.inspireInitReady) {
+      return;
+    }
+    await this.runInspireCli(["--version"], {
+      timeoutMs: 15_000,
+    });
+    this.inspireInitReady = true;
+  }
+
+  private async runInspireCli(
+    args: string[],
+    options?: { timeoutMs?: number; allowFailure?: boolean },
+  ): Promise<CommandRunResult> {
+    const cmd = this.resolveInspireCliCommand();
+    const joinedArgs = args.map((item) => shellQuote(item)).join(" ");
+    const commandLine = `${cmd}${joinedArgs ? ` ${joinedArgs}` : ""}`;
+    const result = await this.runCommand("bash", ["-lc", commandLine], {
+      cwd: this.resolveInspireCliWorkingDir(),
+      env: this.buildInspireCliEnv(),
+      timeoutMs: options?.timeoutMs ?? Math.max(this.config.requestTimeoutMs, 60_000),
+    });
+    if (result.code !== 0 && !options?.allowFailure) {
+      const detail = result.stderr.trim() || result.stdout.trim() || "unknown error";
+      throw new Error(`inspire cli failed (${result.code}): ${detail}`);
+    }
+    return result;
+  }
+
+  private async runInspireCliJson(
+    args: string[],
+    options?: { timeoutMs?: number; allowFailure?: boolean },
+  ): Promise<Record<string, unknown> | undefined> {
+    const result = await this.runInspireCli(["--json", ...args], {
+      timeoutMs: options?.timeoutMs,
+      allowFailure: true,
+    });
+    const rawOutput = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
+    const parsed = rawOutput ? tryParseLastJsonObject(rawOutput) : undefined;
+
+    if (result.code !== 0) {
+      if (options?.allowFailure) {
+        return parsed;
+      }
+      const errorObj = toObject(parsed?.error);
+      const detail = toString(errorObj.message)
+        || toString(parsed?.message)
+        || result.stderr.trim()
+        || result.stdout.trim()
+        || "unknown error";
+      throw new Error(`inspire cli json failed (${result.code}): ${detail}`);
+    }
+    if (!parsed) {
+      if (options?.allowFailure) {
+        return undefined;
+      }
+      throw new Error(`inspire cli returned non-json output for args: ${args.join(" ")}`);
+    }
+    return parsed;
+  }
+
+  private sanitizeInspireNamePart(value: string, fallback: string, maxLength = 28): string {
+    const normalized = value.trim().toLowerCase().replace(/[^a-z0-9-]/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "");
+    if (!normalized) {
+      return fallback;
+    }
+    return normalized.slice(0, Math.max(8, maxLength));
+  }
+
+  private buildInspireNotebookName(binding: OpenClawResolvedUserBinding): string {
+    const prefix = this.sanitizeInspireNamePart(
+      toString(this.config.inspireNotebookNamePrefix, "tfclaw-openclaw"),
+      "tfclaw-openclaw",
+      24,
+    );
+    const suffix = this.sanitizeInspireNamePart(binding.account.username, "user", 24);
+    return `${prefix}-${suffix}`;
+  }
+
+  private buildInspireBridgeProfileName(binding: OpenClawResolvedUserBinding): string {
+    const prefix = this.sanitizeInspireNamePart(
+      toString(this.config.inspireBridgeProfilePrefix, "tfclaw-openclaw"),
+      "tfclaw-openclaw",
+      24,
+    );
+    const suffix = this.sanitizeInspireNamePart(binding.account.username, "user", 24);
+    return `${prefix}-${suffix}`;
+  }
+
+  private resolveInspireOpenclawRoot(): string {
+    const configured = toString(this.config.inspireOpenclawRoot, "").trim();
+    if (configured) {
+      return configured;
+    }
+    return this.config.openclawRoot;
+  }
+
+  private resolveInspireRemoteRuntimeDir(binding: OpenClawResolvedUserBinding): string {
+    const configured = toString(this.config.inspireRemoteRuntimeDir, "").trim() || "~/.tfclaw-openclaw";
+    return configured.replace(/\{user\}/g, binding.account.username);
+  }
+
+  private resolveInspireRemoteWorkspaceDir(binding: OpenClawResolvedUserBinding): string {
+    const configured = toString(this.config.inspireRemoteWorkspaceDir, "").trim();
+    if (configured) {
+      return configured.replace(/\{user\}/g, binding.account.username);
+    }
+    return path.posix.join(this.resolveInspireRemoteRuntimeDir(binding), "workspace");
+  }
+
+  private async patchBindingMetadata(
+    binding: OpenClawResolvedUserBinding,
+    patch: Partial<Pick<OpenClawUserBinding, "runtimeBackend" | "inspireNotebookId" | "inspireBridgeProfile">>,
+  ): Promise<OpenClawResolvedUserBinding> {
+    let nextUpdatedAt = binding.updatedAt;
+    await this.withMapLock(async () => {
+      const map = await this.loadUserMap();
+      const current = map.users[binding.userKey];
+      if (!current) {
+        return;
+      }
+      let changed = false;
+      const next: OpenClawUserBinding = { ...current };
+      if (patch.runtimeBackend !== undefined && next.runtimeBackend !== patch.runtimeBackend) {
+        next.runtimeBackend = patch.runtimeBackend;
+        changed = true;
+      }
+      if (patch.inspireNotebookId !== undefined && next.inspireNotebookId !== patch.inspireNotebookId) {
+        next.inspireNotebookId = patch.inspireNotebookId;
+        changed = true;
+      }
+      if (patch.inspireBridgeProfile !== undefined && next.inspireBridgeProfile !== patch.inspireBridgeProfile) {
+        next.inspireBridgeProfile = patch.inspireBridgeProfile;
+        changed = true;
+      }
+      if (!changed) {
+        nextUpdatedAt = current.updatedAt;
+        return;
+      }
+      next.updatedAt = new Date().toISOString();
+      nextUpdatedAt = next.updatedAt;
+      map.users[binding.userKey] = next;
+      await this.saveUserMap(map);
+    });
+    return {
+      ...binding,
+      ...patch,
+      updatedAt: nextUpdatedAt,
+    };
+  }
+
+  private async listInspireNotebooksByName(
+    notebookName: string,
+  ): Promise<Array<{ notebookId: string; name: string; status: string }>> {
+    const payload = await this.runInspireCliJson([
+      "notebook",
+      "list",
+      "--all-workspaces",
+      "--limit",
+      "200",
+      "--name",
+      notebookName,
+    ], {
+      timeoutMs: 120_000,
+      allowFailure: true,
+    });
+    const items = Array.isArray(payload?.items)
+      ? payload?.items
+      : Array.isArray(payload?.notebooks)
+      ? payload.notebooks
+      : [];
+    return items
+      .map((item) => toObject(item))
+      .map((item) => ({
+        notebookId: toString(item.notebook_id, toString(item.id)).trim(),
+        name: toString(item.name).trim(),
+        status: toString(item.status).trim(),
+      }))
+      .filter((item) => item.notebookId.length > 0);
+  }
+
+  private async fetchInspireNotebookStatus(
+    notebookId: string,
+  ): Promise<{ notebookId: string; name: string; status: string } | undefined> {
+    const payload = await this.runInspireCliJson([
+      "notebook",
+      "status",
+      notebookId,
+    ], {
+      timeoutMs: 90_000,
+      allowFailure: true,
+    });
+    if (!payload) {
+      return undefined;
+    }
+    const resolvedId = toString(payload.notebook_id, toString(payload.id, notebookId)).trim();
+    const status = toString(payload.status).trim();
+    if (!resolvedId) {
+      return undefined;
+    }
+    return {
+      notebookId: resolvedId,
+      name: toString(payload.name).trim(),
+      status,
+    };
+  }
+
+  private async ensureInspireNotebookBinding(binding: OpenClawResolvedUserBinding): Promise<OpenClawResolvedUserBinding> {
+    let notebookId = toString(binding.inspireNotebookId).trim();
+    let notebookStatus = "";
+    if (notebookId) {
+      const detail = await this.fetchInspireNotebookStatus(notebookId);
+      if (detail?.notebookId) {
+        notebookId = detail.notebookId;
+        notebookStatus = detail.status.toUpperCase();
+      } else {
+        notebookId = "";
+      }
+    }
+
+    const notebookName = this.buildInspireNotebookName(binding);
+    if (!notebookId) {
+      const candidates = await this.listInspireNotebooksByName(notebookName);
+      const exact = candidates.find((item) => item.name === notebookName) ?? candidates[0];
+      if (exact?.notebookId) {
+        notebookId = exact.notebookId;
+        notebookStatus = exact.status.toUpperCase();
+      }
+    }
+
+    if (!notebookId) {
+      const createArgs = [
+        "notebook",
+        "create",
+        "--name",
+        notebookName,
+        "--resource",
+        toString(this.config.inspireNotebookResource, "4CPU").trim() || "4CPU",
+        "--wait",
+      ];
+      const project = toString(this.config.inspireNotebookProject, "").trim();
+      if (project) {
+        createArgs.push("--project", project);
+      }
+      const image = toString(this.config.inspireNotebookImage, "").trim();
+      if (image) {
+        createArgs.push("--image", image);
+      }
+      const created = await this.runInspireCliJson(createArgs, {
+        timeoutMs: Math.max(this.config.startupTimeoutMs * 4, 15 * 60 * 1000),
+      });
+      notebookId = toString(created?.notebook_id, toString(created?.id)).trim();
+      if (!notebookId) {
+        throw new Error("inspire notebook create did not return notebook_id");
+      }
+      notebookStatus = "RUNNING";
+      console.log(`[gateway] inspire notebook created: ${notebookName} -> ${notebookId}`);
+    }
+
+    if (notebookStatus !== "RUNNING") {
+      await this.runInspireCliJson([
+        "notebook",
+        "start",
+        notebookId,
+        "--wait",
+      ], {
+        timeoutMs: Math.max(this.config.startupTimeoutMs * 3, 10 * 60 * 1000),
+      });
+      notebookStatus = "RUNNING";
+      console.log(`[gateway] inspire notebook started: ${notebookId}`);
+    }
+
+    return await this.patchBindingMetadata(binding, {
+      runtimeBackend: "inspire-cpu",
+      inspireNotebookId: notebookId,
+    });
+  }
+
+  private async ensureInspireBridgeProfile(
+    binding: OpenClawResolvedUserBinding,
+    notebookId: string,
+  ): Promise<string> {
+    const profileName = toString(binding.inspireBridgeProfile).trim() || this.buildInspireBridgeProfileName(binding);
+    const tunnelListPayload = await this.runInspireCliJson([
+      "tunnel",
+      "list",
+      "--no-check",
+    ], {
+      timeoutMs: 60_000,
+      allowFailure: true,
+    });
+    const bridges = Array.isArray(tunnelListPayload?.bridges)
+      ? tunnelListPayload.bridges.map((item) => toObject(item))
+      : [];
+    const existing = bridges.find((item) => toString(item.name).trim() === profileName);
+    const existingNotebookId = toString(existing?.notebook_id, toString(existing?.notebookId)).trim();
+    if (existing && existingNotebookId === notebookId) {
+      return profileName;
+    }
+
+    await this.runInspireCli([
+      "notebook",
+      "ssh",
+      notebookId,
+      "--wait",
+      "--save-as",
+      profileName,
+      "--command",
+      "true",
+    ], {
+      timeoutMs: Math.max(this.config.startupTimeoutMs * 3, 8 * 60 * 1000),
+    });
+    return profileName;
+  }
+
+  private async runInspireBridgeExec(params: {
+    bridgeProfile: string;
+    command: string;
+    timeoutMs?: number;
+  }): Promise<{ output: string; payload: Record<string, unknown> }> {
+    const timeoutMs = Math.max(10_000, params.timeoutMs ?? this.config.requestTimeoutMs);
+    const timeoutSeconds = Math.max(10, Math.ceil(timeoutMs / 1000));
+    const payload = await this.runInspireCliJson([
+      "bridge",
+      "exec",
+      "--bridge",
+      params.bridgeProfile,
+      "--timeout",
+      String(timeoutSeconds),
+      params.command,
+    ], {
+      timeoutMs: timeoutMs + 45_000,
+    });
+    if (!payload) {
+      throw new Error("inspire bridge exec returned empty payload");
+    }
+    const status = toString(payload.status).trim().toLowerCase();
+    if (status && status !== "ok" && status !== "success") {
+      const detail = toString(payload.message) || toString(payload.error) || "unknown bridge exec failure";
+      throw new Error(`inspire bridge exec failed: ${detail}`);
+    }
+    return {
+      output: toString(payload.output),
+      payload,
+    };
+  }
+
+  private buildInspirePortProbeCommand(port: number): string {
+    const probe = [
+      "if command -v nc >/dev/null 2>&1; then",
+      `  nc -z 127.0.0.1 ${port} >/dev/null 2>&1 && echo OPEN || echo CLOSED`,
+      "else",
+      `  (echo >/dev/tcp/127.0.0.1/${port}) >/dev/null 2>&1 && echo OPEN || echo CLOSED`,
+      "fi",
+    ].join("\n");
+    return `bash -lc ${shellQuote(probe)}`;
+  }
+
+  private async isInspireRemoteGatewayOpen(bridgeProfile: string, port: number): Promise<boolean> {
+    try {
+      const result = await this.runInspireBridgeExec({
+        bridgeProfile,
+        command: this.buildInspirePortProbeCommand(port),
+        timeoutMs: 25_000,
+      });
+      return /\bOPEN\b/i.test(result.output);
+    } catch {
+      return false;
+    }
+  }
+
+  private buildInspireRemoteOpenClawConfig(
+    binding: OpenClawResolvedUserBinding,
+    remoteHomeDir: string,
+    remoteWorkspaceDir: string,
+  ): Record<string, unknown> {
+    const envState = this.loadUserPrivateEnvVars(binding);
+    const runtimeEnvVars = this.loadRuntimeEnvVars(binding, remoteWorkspaceDir, envState.vars);
+    const remoteBinding: OpenClawResolvedUserBinding = {
+      ...binding,
+      account: {
+        ...binding.account,
+        home: remoteHomeDir,
+      },
+    };
+    const baseConfig = this.loadBaseOpenClawConfig();
+    const configObj = this.buildOpenClawConfig(baseConfig, remoteBinding, remoteWorkspaceDir, runtimeEnvVars);
+    const tools = toObject(configObj.tools);
+    const exec = toObject(tools.exec);
+    const applyPatch = toObject(exec.applyPatch);
+    applyPatch.workspaceOnly = false;
+    exec.applyPatch = applyPatch;
+    tools.exec = exec;
+    const fsTools = toObject(tools.fs);
+    fsTools.workspaceOnly = false;
+    delete fsTools.readOnlyRoots;
+    tools.fs = fsTools;
+    configObj.tools = tools;
+    return configObj;
+  }
+
+  private buildInspireGatewayChatClientScript(): string {
+    return [
+      "#!/usr/bin/env node",
+      `"use strict";`,
+      "",
+      "const crypto = require(\"node:crypto\");",
+      "",
+      "function parseArgs(argv) {",
+      "  const out = {};",
+      "  for (let i = 0; i < argv.length; i += 1) {",
+      "    const key = argv[i];",
+      "    if (!key || !key.startsWith(\"--\")) {",
+      "      continue;",
+      "    }",
+      "    const value = argv[i + 1];",
+      "    if (value == null || value.startsWith(\"--\")) {",
+      "      out[key.slice(2)] = \"\";",
+      "      continue;",
+      "    }",
+      "    out[key.slice(2)] = value;",
+      "    i += 1;",
+      "  }",
+      "  return out;",
+      "}",
+      "",
+      "function toText(value) {",
+      "  if (typeof value === \"string\") return value;",
+      "  if (value == null) return \"\";",
+      "  return String(value);",
+      "}",
+      "",
+      "function toObject(value) {",
+      "  if (!value || typeof value !== \"object\" || Array.isArray(value)) return {};",
+      "  return value;",
+      "}",
+      "",
+      "function extractChatText(message) {",
+      "  const obj = toObject(message);",
+      "  const direct = toText(obj.text).trim();",
+      "  if (direct) return direct;",
+      "  const content = obj.content;",
+      "  if (typeof content === \"string\") return content.trim();",
+      "  if (!Array.isArray(content)) return \"\";",
+      "  const lines = [];",
+      "  for (const item of content) {",
+      "    const block = toObject(item);",
+      "    if (toText(block.type).trim().toLowerCase() !== \"text\") continue;",
+      "    const text = toText(block.text).trim();",
+      "    if (text) lines.push(text);",
+      "  }",
+      "  return lines.join(\"\\n\").trim();",
+      "}",
+      "",
+      "function isUnsupportedParamError(text) {",
+      "  const normalized = toText(text).toLowerCase();",
+      "  return normalized.includes(\"messagechannel\") || normalized.includes(\"requestersenderid\") || normalized.includes(\"unknown field\");",
+      "}",
+      "",
+      "function fail(error) {",
+      "  const message = error instanceof Error ? error.message : String(error);",
+      "  process.stdout.write(`${JSON.stringify({ ok: false, error: message })}\\n`);",
+      "  process.exit(1);",
+      "}",
+      "",
+      "(async () => {",
+      "  try {",
+      "    const args = parseArgs(process.argv.slice(2));",
+      "    const gatewayUrl = toText(args[\"gateway-url\"]).trim();",
+      "    const gatewayToken = toText(args[\"gateway-token\"]).trim();",
+      "    const payloadB64 = toText(args[\"payload-b64\"]).trim();",
+      "    const timeoutMs = Number.parseInt(toText(args[\"timeout-ms\"]).trim() || \"600000\", 10);",
+      "    if (!gatewayUrl || !payloadB64) {",
+      "      throw new Error(\"missing --gateway-url or --payload-b64\");",
+      "    }",
+      "    let payload = {};",
+      "    try {",
+      "      payload = JSON.parse(Buffer.from(payloadB64, \"base64\").toString(\"utf8\"));",
+      "    } catch (error) {",
+      "      throw new Error(`invalid payload-b64: ${error instanceof Error ? error.message : String(error)}`);",
+      "    }",
+      "",
+      "    let WebSocketImpl = globalThis.WebSocket;",
+      "    if (!WebSocketImpl) {",
+      "      try {",
+      "        const wsModule = require(\"ws\");",
+      "        WebSocketImpl = wsModule.default || wsModule;",
+      "      } catch (error) {",
+      "        throw new Error(`ws module unavailable: ${error instanceof Error ? error.message : String(error)}`);",
+      "      }",
+      "    }",
+      "",
+      "    const connectReqId = `connect_${Date.now()}_${Math.random().toString(16).slice(2)}`;",
+      "    const chatReqId = `chat_${Date.now()}_${Math.random().toString(16).slice(2)}`;",
+      "    const ws = new WebSocketImpl(gatewayUrl);",
+      "    let closed = false;",
+      "    let connectSent = false;",
+      "    let chatSent = false;",
+      "    let retryWithoutExtended = false;",
+      "    let runId = \"\";",
+      "    let lastDelta = \"\";",
+      "",
+      "    const timer = setTimeout(() => {",
+      "      fail(`timeout after ${Number.isFinite(timeoutMs) ? timeoutMs : 600000}ms`);",
+      "    }, Number.isFinite(timeoutMs) ? timeoutMs : 600000);",
+      "",
+      "    const closeSocket = () => {",
+      "      if (closed) return;",
+      "      closed = true;",
+      "      clearTimeout(timer);",
+      "      try { ws.close(); } catch { /* noop */ }",
+      "    };",
+      "",
+      "    const sendConnect = () => {",
+      "      if (connectSent) return;",
+      "      connectSent = true;",
+      "      ws.send(JSON.stringify({",
+      "        type: \"req\",",
+      "        id: connectReqId,",
+      "        method: \"connect\",",
+      "        params: {",
+      "          minProtocol: 1,",
+      "          maxProtocol: 99,",
+      "          client: { id: `tfclaw-inspire-${crypto.randomBytes(6).toString(\"hex\")}`, mode: \"openclaw\", platform: \"node\" },",
+      "          role: \"operator\",",
+      "          scopes: [\"operator\"],",
+      "          auth: gatewayToken ? { token: gatewayToken } : undefined,",
+      "        },",
+      "      }));",
+      "    };",
+      "",
+      "    ws.on(\"open\", () => {",
+      "      setTimeout(() => sendConnect(), 150);",
+      "    });",
+      "",
+      "    ws.on(\"error\", (error) => {",
+      "      fail(`websocket error: ${error.message}`);",
+      "    });",
+      "",
+      "    ws.on(\"close\", (code, reason) => {",
+      "      if (closed) return;",
+      "      const detail = toText(reason).trim();",
+      "      fail(`gateway closed (${code})${detail ? `: ${detail}` : \"\"}`);",
+      "    });",
+      "",
+      "    ws.on(\"message\", (raw) => {",
+      "      let frame = {};",
+      "      try {",
+      "        frame = JSON.parse(typeof raw === \"string\" ? raw : raw.toString());",
+      "      } catch {",
+      "        return;",
+      "      }",
+      "      const type = toText(frame.type).trim().toLowerCase();",
+      "      if (type === \"event\") {",
+      "        const eventName = toText(frame.event).trim().toLowerCase();",
+      "        if (eventName === \"connect.challenge\" && !connectSent) {",
+      "          sendConnect();",
+      "          return;",
+      "        }",
+      "        if (eventName !== \"chat\") {",
+      "          return;",
+      "        }",
+      "        const payloadObj = toObject(frame.payload);",
+      "        const payloadRunId = toText(payloadObj.runId).trim();",
+      "        if (runId && payloadRunId && payloadRunId !== runId) {",
+      "          return;",
+      "        }",
+      "        if (!runId && payloadRunId) {",
+      "          runId = payloadRunId;",
+      "        }",
+      "        const state = toText(payloadObj.state).trim().toLowerCase();",
+      "        if (state === \"delta\") {",
+      "          const text = extractChatText(payloadObj.message);",
+      "          if (text) lastDelta = text;",
+      "          return;",
+      "        }",
+      "        if (state === \"final\") {",
+      "          const text = extractChatText(payloadObj.message) || lastDelta || \"\";",
+      "          closeSocket();",
+      "          process.stdout.write(`${JSON.stringify({ ok: true, text, media: [], audioAsVoice: false })}\\n`);",
+      "          process.exit(0);",
+      "          return;",
+      "        }",
+      "        if (state === \"error\") {",
+      "          fail(toText(payloadObj.errorMessage).trim() || \"chat state=error\");",
+      "          return;",
+      "        }",
+      "        return;",
+      "      }",
+      "",
+      "      if (type !== \"res\") {",
+      "        return;",
+      "      }",
+      "",
+      "      const id = toText(frame.id).trim();",
+      "      const ok = Boolean(frame.ok);",
+      "      if (id === connectReqId) {",
+      "        if (!ok) {",
+      "          fail(`connect failed: ${toText(frame.error || frame.message).trim() || \"unknown error\"}`);",
+      "          return;",
+      "        }",
+      "        const reqPayload = toObject(payload);",
+      "        const chatParams = {",
+      "          sessionKey: toText(reqPayload.sessionKey).trim() || \"main\",",
+      "          message: toText(reqPayload.message),",
+      "          messageChannel: retryWithoutExtended ? undefined : toText(reqPayload.messageChannel).trim() || undefined,",
+      "          deliver: false,",
+      "          timeoutMs: Number.isFinite(Number(reqPayload.timeoutMs)) ? Number(reqPayload.timeoutMs) : undefined,",
+      "          idempotencyKey: `tfclaw-inspire-${crypto.randomBytes(8).toString(\"hex\")}`,",
+      "          requesterSenderId: retryWithoutExtended ? undefined : toText(reqPayload.requesterSenderId).trim() || undefined,",
+      "        };",
+      "        chatSent = true;",
+      "        ws.send(JSON.stringify({ type: \"req\", id: chatReqId, method: \"chat.send\", params: chatParams }));",
+      "        return;",
+      "      }",
+      "",
+      "      if (id === chatReqId) {",
+      "        if (!ok) {",
+      "          const detail = toText(frame.error || frame.message).trim() || \"chat.send failed\";",
+      "          if (!retryWithoutExtended && isUnsupportedParamError(detail)) {",
+      "            retryWithoutExtended = true;",
+      "            chatSent = false;",
+      "            const reqPayload = toObject(payload);",
+      "            const chatParams = {",
+      "              sessionKey: toText(reqPayload.sessionKey).trim() || \"main\",",
+      "              message: toText(reqPayload.message),",
+      "              deliver: false,",
+      "              timeoutMs: Number.isFinite(Number(reqPayload.timeoutMs)) ? Number(reqPayload.timeoutMs) : undefined,",
+      "              idempotencyKey: `tfclaw-inspire-${crypto.randomBytes(8).toString(\"hex\")}`,",
+      "            };",
+      "            chatSent = true;",
+      "            ws.send(JSON.stringify({ type: \"req\", id: chatReqId, method: \"chat.send\", params: chatParams }));",
+      "            return;",
+      "          }",
+      "          fail(detail);",
+      "          return;",
+      "        }",
+      "        const payloadObj = toObject(frame.payload);",
+      "        const status = toText(payloadObj.status).trim().toLowerCase();",
+      "        if (status === \"ok\" && !toText(payloadObj.runId).trim()) {",
+      "          closeSocket();",
+      "          process.stdout.write(`${JSON.stringify({ ok: true, text: toText(payloadObj.summary).trim(), media: [], audioAsVoice: false })}\\n`);",
+      "          process.exit(0);",
+      "          return;",
+      "        }",
+      "      }",
+      "    });",
+      "",
+      "  } catch (error) {",
+      "    fail(error);",
+      "  }",
+      "})();",
+      "",
+    ].join("\n");
+  }
+
+  private async ensureInspireRemoteAssets(
+    binding: OpenClawResolvedUserBinding,
+    bridgeProfile: string,
+  ): Promise<{
+    remoteHomeDir: string;
+    remoteRuntimeDir: string;
+    remoteWorkspaceDir: string;
+    remoteConfigPath: string;
+    remoteChatClientPath: string;
+  }> {
+    const homeProbe = await this.runInspireBridgeExec({
+      bridgeProfile,
+      command: "bash -lc 'printf %s \"$HOME\"'",
+      timeoutMs: 25_000,
+    });
+    const remoteHomeDir = homeProbe.output.trim() || "/root";
+    const remoteRuntimeDir = this.resolveInspireRemoteRuntimeDir(binding);
+    const remoteWorkspaceDir = this.resolveInspireRemoteWorkspaceDir(binding);
+    const remoteConfigPath = path.posix.join(remoteRuntimeDir, OPENCLAW_BRIDGE_INSPIRE_REMOTE_CONFIG_FILENAME);
+    const remoteChatClientPath = path.posix.join(remoteRuntimeDir, OPENCLAW_BRIDGE_INSPIRE_CHAT_CLIENT_FILENAME);
+    const remoteConfig = this.buildInspireRemoteOpenClawConfig(binding, remoteHomeDir, remoteWorkspaceDir);
+    const configBase64 = Buffer.from(`${JSON.stringify(remoteConfig, null, 2)}\n`, "utf8").toString("base64");
+    const chatClientBase64 = Buffer.from(this.buildInspireGatewayChatClientScript(), "utf8").toString("base64");
+    await this.runInspireBridgeExec({
+      bridgeProfile,
+      command: [
+        "set -euo pipefail",
+        `mkdir -p ${shellQuote(remoteRuntimeDir)} ${shellQuote(remoteWorkspaceDir)} ${shellQuote(path.posix.join(remoteWorkspaceDir, "skills"))}`,
+        `printf %s ${shellQuote(configBase64)} | base64 -d > ${shellQuote(remoteConfigPath)}`,
+        `printf %s ${shellQuote(chatClientBase64)} | base64 -d > ${shellQuote(remoteChatClientPath)}`,
+        `chmod 600 ${shellQuote(remoteConfigPath)}`,
+        `chmod 700 ${shellQuote(remoteChatClientPath)}`,
+      ].join(" && "),
+      timeoutMs: Math.max(this.config.requestTimeoutMs, 120_000),
+    });
+    return {
+      remoteHomeDir,
+      remoteRuntimeDir,
+      remoteWorkspaceDir,
+      remoteConfigPath,
+      remoteChatClientPath,
+    };
+  }
+
+  private async ensureInspireNotebookOpenClawProcess(
+    binding: OpenClawResolvedUserBinding,
+    _runtime: { workspaceDir: string },
+    options?: { forceRestart?: boolean },
+  ): Promise<OpenClawResolvedUserBinding> {
+    await this.ensureInspireBackendReady();
+    const forceRestart = options?.forceRestart === true;
+    let nextBinding = await this.patchBindingMetadata(binding, {
+      runtimeBackend: "inspire-cpu",
+    });
+    const existingProfile = toString(nextBinding.inspireBridgeProfile).trim();
+    if (!forceRestart && existingProfile) {
+      const alreadyOpen = await this.isInspireRemoteGatewayOpen(existingProfile, nextBinding.gatewayPort);
+      if (alreadyOpen) {
+        return nextBinding;
+      }
+    }
+
+    nextBinding = await this.ensureInspireNotebookBinding(nextBinding);
+    const notebookId = toString(nextBinding.inspireNotebookId).trim();
+    if (!notebookId) {
+      throw new Error("inspire notebook id is missing after ensure flow");
+    }
+
+    const bridgeProfile = await this.ensureInspireBridgeProfile(nextBinding, notebookId);
+    nextBinding = await this.patchBindingMetadata(nextBinding, {
+      runtimeBackend: "inspire-cpu",
+      inspireBridgeProfile: bridgeProfile,
+      inspireNotebookId: notebookId,
+    });
+
+    if (!forceRestart && await this.isInspireRemoteGatewayOpen(bridgeProfile, nextBinding.gatewayPort)) {
+      return nextBinding;
+    }
+
+    const remoteAssets = await this.ensureInspireRemoteAssets(nextBinding, bridgeProfile);
+    const sessionName = this.sanitizeInspireNamePart(`oc-${nextBinding.account.username}`, "oc-bridge", 30);
+    const remoteOpenclawRoot = this.resolveInspireOpenclawRoot();
+    const remoteGatewayLogPath = path.posix.join(
+      remoteAssets.remoteRuntimeDir,
+      `openclaw-gateway-${nextBinding.gatewayPort}.log`,
+    );
+    const startEnvPrefix = [
+      `HOME=${shellQuote(remoteAssets.remoteHomeDir)}`,
+      `USER=${shellQuote(nextBinding.account.username)}`,
+      `LOGNAME=${shellQuote(nextBinding.account.username)}`,
+      "NODE_DISABLE_COMPILE_CACHE=1",
+      `OPENCLAW_HOME=${shellQuote(remoteAssets.remoteHomeDir)}`,
+      `CLAWHUB_WORKDIR=${shellQuote(remoteAssets.remoteWorkspaceDir)}`,
+      `OPENCLAW_CONFIG_PATH=${shellQuote(remoteAssets.remoteConfigPath)}`,
+      `OPENCLAW_GATEWAY_TOKEN=${shellQuote(nextBinding.gatewayToken)}`,
+    ].join(" ");
+    const startInner = [
+      "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy NO_PROXY no_proxy npm_config_proxy npm_config_https_proxy npm_config_http_proxy npm_config_noproxy",
+      "umask 077",
+      `cd ${shellQuote(remoteOpenclawRoot)}`,
+      `${startEnvPrefix} exec node ${shellQuote(path.posix.join(remoteOpenclawRoot, "openclaw.mjs"))} gateway --allow-unconfigured --port ${nextBinding.gatewayPort} --bind loopback --auth token --token ${shellQuote(nextBinding.gatewayToken)}`,
+    ].join(" && ");
+
+    const restartCommandParts: string[] = [
+      "set -euo pipefail",
+      `mkdir -p ${shellQuote(remoteAssets.remoteRuntimeDir)} ${shellQuote(remoteAssets.remoteWorkspaceDir)} ${shellQuote(path.posix.join(remoteAssets.remoteWorkspaceDir, "skills"))}`,
+      `if command -v tmux >/dev/null 2>&1; then tmux has-session -t ${shellQuote(sessionName)} 2>/dev/null && tmux kill-session -t ${shellQuote(sessionName)} || true; fi`,
+      `pkill -f ${shellQuote(`openclaw.mjs gateway --allow-unconfigured --port ${nextBinding.gatewayPort}`)} >/dev/null 2>&1 || true`,
+      `pkill -f ${shellQuote(`openclaw.mjs gateway --port ${nextBinding.gatewayPort}`)} >/dev/null 2>&1 || true`,
+    ];
+    if (!forceRestart) {
+      restartCommandParts.splice(-2, 2);
+    }
+    restartCommandParts.push(
+      `if command -v tmux >/dev/null 2>&1; then tmux new-session -d -s ${shellQuote(sessionName)} bash -lc ${shellQuote(startInner)}; else nohup bash -lc ${shellQuote(startInner)} > ${shellQuote(remoteGatewayLogPath)} 2>&1 < /dev/null & fi`,
+    );
+    await this.runInspireBridgeExec({
+      bridgeProfile,
+      command: restartCommandParts.join(" && "),
+      timeoutMs: Math.max(this.config.startupTimeoutMs, 90_000),
+    });
+
+    const deadline = Date.now() + Math.max(this.config.startupTimeoutMs, 30_000);
+    while (Date.now() < deadline) {
+      if (await this.isInspireRemoteGatewayOpen(bridgeProfile, nextBinding.gatewayPort)) {
+        return nextBinding;
+      }
+      await delay(1200);
+    }
+
+    const tail = await this.runInspireBridgeExec({
+      bridgeProfile,
+      command: `bash -lc ${shellQuote([
+        `if command -v tmux >/dev/null 2>&1 && tmux has-session -t ${sessionName} 2>/dev/null; then`,
+        `  tmux capture-pane -p -S -80 -t ${sessionName}:0.0`,
+        `elif [ -f ${shellQuote(remoteGatewayLogPath)} ]; then`,
+        `  tail -n 80 ${shellQuote(remoteGatewayLogPath)}`,
+        "else",
+        "  echo '(no remote openclaw log found)'",
+        "fi",
+      ].join("\n"))}`,
+      timeoutMs: 45_000,
+    });
+    throw new Error(
+      `inspire openclaw gateway did not become ready on 127.0.0.1:${nextBinding.gatewayPort}. remote tail:\n${tail.output.trim() || "(empty)"}`,
+    );
+  }
+
+  private stageInboundAttachmentsForInspire(
+    attachments: BridgeInboundAttachment[],
+  ): {
+    promptLines: string[];
+    gatewayAttachments: Array<{ type: "image"; mimeType: string; fileName: string; content: string }>;
+  } {
+    if (attachments.length === 0) {
+      return {
+        promptLines: [],
+        gatewayAttachments: [],
+      };
+    }
+    const promptLines: string[] = [];
+    for (const [index, item] of attachments.entries()) {
+      const decoded = Buffer.from(item.contentBase64, "base64");
+      if (decoded.byteLength === 0 || decoded.byteLength > OPENCLAW_BRIDGE_INBOUND_MAX_FILE_BYTES) {
+        continue;
+      }
+      const safeName = this.sanitizeAttachmentFileName(item.fileName, `${item.messageType || "file"}-${index + 1}`);
+      const mimeType = this.normalizeMimeType(item.mimeType);
+      promptLines.push(
+        `${index + 1}. ${safeName} | type=${item.messageType || "file"} | mime=${mimeType} | source=inspire-inline`,
+      );
+    }
+    return {
+      promptLines,
+      gatewayAttachments: [],
+    };
+  }
+
+  private async callGatewayChatViaInspireBridge(params: {
+    binding: OpenClawResolvedUserBinding;
+    sessionKey: string;
+    message: string;
+    messageChannel?: string;
+    requesterSenderId?: string;
+  }): Promise<OpenClawBridgeResponse> {
+    const bridgeProfile = toString(params.binding.inspireBridgeProfile).trim();
+    if (!bridgeProfile) {
+      throw new Error("inspire bridge profile is missing");
+    }
+    const remoteRuntimeDir = this.resolveInspireRemoteRuntimeDir(params.binding);
+    const remoteChatClientPath = path.posix.join(remoteRuntimeDir, OPENCLAW_BRIDGE_INSPIRE_CHAT_CLIENT_FILENAME);
+    const payload = {
+      sessionKey: params.sessionKey,
+      message: params.message,
+      messageChannel: params.messageChannel?.trim() || undefined,
+      requesterSenderId: params.requesterSenderId?.trim() || undefined,
+      timeoutMs: this.config.requestTimeoutMs,
+    };
+    const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64");
+    const remoteResult = await this.runInspireBridgeExec({
+      bridgeProfile,
+      command: [
+        "set -euo pipefail",
+        `node ${shellQuote(remoteChatClientPath)} --gateway-url ${shellQuote(`ws://127.0.0.1:${params.binding.gatewayPort}`)} --gateway-token ${shellQuote(params.binding.gatewayToken)} --payload-b64 ${shellQuote(payloadB64)} --timeout-ms ${shellQuote(String(this.config.requestTimeoutMs))}`,
+      ].join(" && "),
+      timeoutMs: this.config.requestTimeoutMs + 30_000,
+    });
+    const parsed = tryParseLastJsonObject(remoteResult.output);
+    if (!parsed) {
+      throw new Error(`inspire chat client returned non-json output: ${remoteResult.output.trim() || "(empty)"}`);
+    }
+    if (!toBoolean(parsed.ok, false)) {
+      const detail = toString(parsed.error) || "inspire chat client failed";
+      throw new Error(detail);
+    }
+    const mediaRaw = Array.isArray(parsed.media) ? parsed.media : [];
+    const media = mediaRaw
+      .map((item) => toObject(item))
+      .map((item): OpenClawBridgeMediaItem | undefined => {
+        const kindRaw = toString(item.kind).trim().toLowerCase();
+        const kind: "image" | "file" = kindRaw === "image" ? "image" : "file";
+        const contentBase64 = toString(item.contentBase64).trim();
+        if (!contentBase64) {
+          return undefined;
+        }
+        const fileName = this.sanitizeAttachmentFileName(toString(item.fileName), kind === "image" ? "image" : "file");
+        const mimeType = this.normalizeMimeType(toString(item.mimeType, this.inferMimeTypeFromFileName(fileName)));
+        return {
+          kind,
+          fileName,
+          mimeType,
+          contentBase64,
+          source: "inspire-gateway-chat-client",
+        };
+      })
+      .filter((item): item is OpenClawBridgeMediaItem => Boolean(item));
+    return {
+      text: toString(parsed.text).trim(),
+      media,
+      audioAsVoice: toBoolean(parsed.audioAsVoice, false),
+    };
   }
 
   private stageInboundAttachments(
@@ -2620,6 +3648,9 @@ class OpenClawPerUserBridge {
           gatewayToken,
           createdAt: toString(item.createdAt, new Date().toISOString()),
           updatedAt: toString(item.updatedAt, new Date().toISOString()),
+          runtimeBackend: toString(item.runtimeBackend).trim() === "inspire-cpu" ? "inspire-cpu" : "local",
+          inspireNotebookId: toString(item.inspireNotebookId).trim() || undefined,
+          inspireBridgeProfile: toString(item.inspireBridgeProfile).trim() || undefined,
         };
       }
       return { version: 1, users };
@@ -2936,6 +3967,11 @@ class OpenClawPerUserBridge {
         entry.gatewayPort = await this.allocateGatewayPort(map, seedHash);
         changed = true;
       }
+      const expectedBackend: "local" | "inspire-cpu" = this.isInspireCpuBackend ? "inspire-cpu" : "local";
+      if (entry.runtimeBackend !== expectedBackend) {
+        entry.runtimeBackend = expectedBackend;
+        changed = true;
+      }
 
       const account = await this.ensureLinuxUser(entry.linuxUser);
 
@@ -2954,6 +3990,9 @@ class OpenClawPerUserBridge {
         gatewayToken: entry.gatewayToken,
         createdAt: entry.createdAt,
         updatedAt: entry.updatedAt,
+        runtimeBackend: entry.runtimeBackend,
+        inspireNotebookId: entry.inspireNotebookId,
+        inspireBridgeProfile: entry.inspireBridgeProfile,
         account,
       };
     });
@@ -3400,7 +4439,11 @@ class OpenClawPerUserBridge {
     this.writeUserPrivateEnvFile(binding, envState.envFilePath, envState.vars);
 
     const runtime = this.prepareUserRuntime(binding);
-    await this.ensureTmuxOpenClawProcess(binding, runtime, { forceRestart: true });
+    if (this.isInspireCpuBackend) {
+      await this.ensureInspireNotebookOpenClawProcess(binding, runtime, { forceRestart: true });
+    } else {
+      await this.ensureTmuxOpenClawProcess(binding, runtime, { forceRestart: true });
+    }
     return { key, envFilePath: envState.envFilePath };
   }
 
@@ -3424,7 +4467,11 @@ class OpenClawPerUserBridge {
       delete envState.vars[key];
       this.writeUserPrivateEnvFile(binding, envState.envFilePath, envState.vars);
       const runtime = this.prepareUserRuntime(binding);
-      await this.ensureTmuxOpenClawProcess(binding, runtime, { forceRestart: true });
+      if (this.isInspireCpuBackend) {
+        await this.ensureInspireNotebookOpenClawProcess(binding, runtime, { forceRestart: true });
+      } else {
+        await this.ensureTmuxOpenClawProcess(binding, runtime, { forceRestart: true });
+      }
     }
     return { key, removed, envFilePath: envState.envFilePath };
   }
@@ -5802,6 +6849,33 @@ function loadGatewayConfig(): LoadedGatewayConfig {
       toString(rawFeishu.encryptKey, toString(process.env.FEISHU_ENCRYPT_KEY, "")),
     ),
   );
+  const rawOpenClawRuntimeBackend = toString(
+    rawOpenClawBridge.runtimeBackend,
+    process.env.TFCLAW_OPENCLAW_RUNTIME_BACKEND ?? "local",
+  ).trim().toLowerCase();
+  const openclawRuntimeBackend: "local" | "inspire-cpu" = rawOpenClawRuntimeBackend === "inspire-cpu"
+    ? "inspire-cpu"
+    : "local";
+  const openclawInspireCliModuleDir = resolvePathFromBase(
+    toString(
+      rawOpenClawBridge.inspireCliModuleDir,
+      process.env.TFCLAW_OPENCLAW_INSPIRE_CLI_MODULE_DIR ?? "",
+    ),
+    configDir,
+    { allowEmpty: true },
+  );
+  const openclawInspireOpenclawRoot = toString(
+    rawOpenClawBridge.inspireOpenclawRoot,
+    process.env.TFCLAW_OPENCLAW_INSPIRE_OPENCLAW_ROOT ?? openclawRootFallback,
+  ).trim();
+  const openclawInspireRemoteRuntimeDir = toString(
+    rawOpenClawBridge.inspireRemoteRuntimeDir,
+    process.env.TFCLAW_OPENCLAW_INSPIRE_REMOTE_RUNTIME_DIR ?? "~/.tfclaw-openclaw",
+  ).trim();
+  const openclawInspireRemoteWorkspaceDir = toString(
+    rawOpenClawBridge.inspireRemoteWorkspaceDir,
+    process.env.TFCLAW_OPENCLAW_INSPIRE_REMOTE_WORKSPACE_DIR ?? "",
+  ).trim() || path.posix.join(openclawInspireRemoteRuntimeDir, "workspace");
 
   const relayToken = toString(rawRelay.token, process.env.TFCLAW_TOKEN ?? "");
   if (!relayToken) {
@@ -5822,6 +6896,7 @@ function loadGatewayConfig(): LoadedGatewayConfig {
     },
     openclawBridge: {
       enabled: toBoolean(rawOpenClawBridge.enabled, openclawBridgeEnabledFallback),
+      runtimeBackend: openclawRuntimeBackend,
       openclawRoot: openclawRootFallback,
       stateDir: openclawStateDir,
       sharedEnvPath: openclawSharedEnvPath,
@@ -5865,6 +6940,46 @@ function loadGatewayConfig(): LoadedGatewayConfig {
           ),
         ),
       ),
+      inspireCliCommand: toString(
+        rawOpenClawBridge.inspireCliCommand,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_CLI_COMMAND ?? "inspire",
+      ),
+      inspireCliModuleDir: openclawInspireCliModuleDir,
+      inspireBaseUrl: toString(
+        rawOpenClawBridge.inspireBaseUrl,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_BASE_URL ?? process.env.INSPIRE_BASE_URL ?? "",
+      ),
+      inspireUsername: toString(
+        rawOpenClawBridge.inspireUsername,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_USERNAME ?? process.env.INSPIRE_USERNAME ?? "",
+      ),
+      inspirePasswordEnvKey: toString(
+        rawOpenClawBridge.inspirePasswordEnvKey,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_PASSWORD_ENV_KEY ?? "INSPIRE_PASSWORD",
+      ),
+      inspireNotebookNamePrefix: toString(
+        rawOpenClawBridge.inspireNotebookNamePrefix,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_NOTEBOOK_NAME_PREFIX ?? "tfclaw-openclaw",
+      ),
+      inspireNotebookResource: toString(
+        rawOpenClawBridge.inspireNotebookResource,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_NOTEBOOK_RESOURCE ?? "4CPU",
+      ),
+      inspireNotebookImage: toString(
+        rawOpenClawBridge.inspireNotebookImage,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_NOTEBOOK_IMAGE ?? "",
+      ),
+      inspireNotebookProject: toString(
+        rawOpenClawBridge.inspireNotebookProject,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_NOTEBOOK_PROJECT ?? "",
+      ),
+      inspireBridgeProfilePrefix: toString(
+        rawOpenClawBridge.inspireBridgeProfilePrefix,
+        process.env.TFCLAW_OPENCLAW_INSPIRE_BRIDGE_PROFILE_PREFIX ?? "tfclaw-openclaw",
+      ),
+      inspireOpenclawRoot: openclawInspireOpenclawRoot,
+      inspireRemoteRuntimeDir: openclawInspireRemoteRuntimeDir,
+      inspireRemoteWorkspaceDir: openclawInspireRemoteWorkspaceDir,
     },
     channels: {
       whatsapp: {
@@ -12212,7 +13327,7 @@ async function bootstrap(): Promise<void> {
   }
   if (openclawBridge.enabled) {
     console.log(
-      `[gateway] openclaw bridge: enabled -> root=${loaded.config.openclawBridge.openclawRoot}, stateDir=${loaded.config.openclawBridge.stateDir}, sharedEnvPath=${loaded.config.openclawBridge.sharedEnvPath}, sharedSkillsDir=${loaded.config.openclawBridge.sharedSkillsDir}, userHomeRoot=${loaded.config.openclawBridge.userHomeRoot}, userPrefix=${loaded.config.openclawBridge.userPrefix}, portRange=${loaded.config.openclawBridge.gatewayPortBase}-${loaded.config.openclawBridge.gatewayPortMax}`,
+      `[gateway] openclaw bridge: enabled -> backend=${loaded.config.openclawBridge.runtimeBackend}, root=${loaded.config.openclawBridge.openclawRoot}, stateDir=${loaded.config.openclawBridge.stateDir}, sharedEnvPath=${loaded.config.openclawBridge.sharedEnvPath}, sharedSkillsDir=${loaded.config.openclawBridge.sharedSkillsDir}, userHomeRoot=${loaded.config.openclawBridge.userHomeRoot}, userPrefix=${loaded.config.openclawBridge.userPrefix}, portRange=${loaded.config.openclawBridge.gatewayPortBase}-${loaded.config.openclawBridge.gatewayPortMax}`,
     );
   } else {
     console.log("[gateway] openclaw bridge: disabled");

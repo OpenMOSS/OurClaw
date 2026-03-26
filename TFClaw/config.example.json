@@ -5,6 +5,7 @@
   },
   "openclawBridge": {
     "enabled": true,
+    "runtimeBackend": "local",
     "openclawRoot": "../openclaw",
     "stateDir": ".runtime/openclaw_bridge",
     "sharedSkillsDir": "../openclaw/skills",
@@ -20,7 +21,20 @@
     "nodePath": "/usr/bin/node",
     "configTemplatePath": "~/.openclaw/openclaw.json",
     "autoBuildDist": false,
-    "allowAutoCreateUser": true
+    "allowAutoCreateUser": true,
+    "inspireCliCommand": "inspire",
+    "inspireCliModuleDir": "",
+    "inspireBaseUrl": "",
+    "inspireUsername": "",
+    "inspirePasswordEnvKey": "INSPIRE_PASSWORD",
+    "inspireNotebookNamePrefix": "tfclaw-openclaw",
+    "inspireNotebookResource": "4CPU",
+    "inspireNotebookImage": "",
+    "inspireNotebookProject": "",
+    "inspireBridgeProfilePrefix": "tfclaw-openclaw",
+    "inspireOpenclawRoot": "/inspire/qb-ilm/project/cq-scientific-cooperation-zone/ky26016/WeClaw/openclaw",
+    "inspireRemoteRuntimeDir": "~/.tfclaw-openclaw",
+    "inspireRemoteWorkspaceDir": "~/.tfclaw-openclaw/workspace"
   },
   "channels": {
     "feishu": {

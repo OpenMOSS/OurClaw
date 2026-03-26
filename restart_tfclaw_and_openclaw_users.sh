@@ -494,6 +494,10 @@ OPENCLAW_ROOT_RAW="$(jq -r '.openclawBridge.openclawRoot // empty' "$CONFIG_PATH
 if [[ -z "$OPENCLAW_ROOT_RAW" ]]; then
   OPENCLAW_ROOT_RAW="../openclaw"
 fi
+OPENCLAW_RUNTIME_BACKEND="$(jq -r '.openclawBridge.runtimeBackend // "local"' "$CONFIG_PATH" | tr '[:upper:]' '[:lower:]')"
+if [[ "$OPENCLAW_RUNTIME_BACKEND" != "inspire-cpu" ]]; then
+  OPENCLAW_RUNTIME_BACKEND="local"
+fi
 OPENCLAW_ROOT="$(resolve_from_tfclaw_root "$OPENCLAW_ROOT_RAW")"
 OPENCLAW_ROOT="$(readlink -f "$OPENCLAW_ROOT" 2>/dev/null || echo "$OPENCLAW_ROOT")"
 if [[ ! -d "$OPENCLAW_ROOT" ]]; then
@@ -692,7 +696,9 @@ restart_relay_tmux_session
 mapfile -t USERS < <(jq -r '.users // {} | to_entries[]? | [.value.linuxUser, (.value.gatewayPort|tostring), .value.gatewayToken] | @tsv' "$MAP_PATH")
 
 echo "[2/4] restarting mapped openclaw users"
-if [[ "${#USERS[@]}" -eq 0 ]]; then
+if [[ "$OPENCLAW_RUNTIME_BACKEND" == "inspire-cpu" ]]; then
+  echo "skip local mapped-user restart: runtimeBackend=inspire-cpu"
+elif [[ "${#USERS[@]}" -eq 0 ]]; then
   echo "no mapped users found in $MAP_PATH"
 else
   for row in "${USERS[@]}"; do
