@@ -381,7 +381,7 @@ restart_relay_tmux_session() {
     tmux kill-session -t "$RELAY_SESSION"
   fi
   TMUX= TMUX_PANE= tmux new-session -d -s "$RELAY_SESSION" \
-    "bash -lc 'cd \"$TFCLAW_ROOT\" && RELAY_HOST=\"$RELAY_BIND_HOST\" RELAY_PORT=\"$RELAY_PORT\" RELAY_WS_PATH=\"$RELAY_WS_PATH\" npm exec tsx watch apps/server/src/index.ts'"
+    "bash -lc 'cd \"$TFCLAW_ROOT\" && RELAY_HOST=\"$RELAY_BIND_HOST\" RELAY_PORT=\"$RELAY_PORT\" RELAY_WS_PATH=\"$RELAY_WS_PATH\" npm exec tsx apps/server/src/index.ts'"
   TMUX= TMUX_PANE= tmux pipe-pane -o -t "${RELAY_SESSION}:0.0" "cat >> \"$RELAY_LOG_PATH\"" >/dev/null 2>&1 || true
   TMUX= TMUX_PANE= tmux capture-pane -p -S -200 -t "${RELAY_SESSION}:0.0" >> "$RELAY_LOG_PATH" 2>/dev/null || true
 }
@@ -1301,7 +1301,7 @@ if tmux has-session -t "$GATEWAY_SESSION" 2>/dev/null; then
   tmux kill-session -t "$GATEWAY_SESSION"
 fi
 TMUX= TMUX_PANE= tmux new-session -d -s "$GATEWAY_SESSION" \
-  "bash -lc 'cd \"$TFCLAW_ROOT\" && npm exec tsx watch apps/feishu-gateway/src/index.ts'"
+  "bash -lc 'cd \"$TFCLAW_ROOT\" && npm exec tsx apps/feishu-gateway/src/index.ts'"
 TMUX= TMUX_PANE= tmux pipe-pane -o -t "${GATEWAY_SESSION}:0.0" "cat >> \"$GATEWAY_LOG_PATH\"" >/dev/null 2>&1 || true
 TMUX= TMUX_PANE= tmux capture-pane -p -S -200 -t "${GATEWAY_SESSION}:0.0" >> "$GATEWAY_LOG_PATH" 2>/dev/null || true
 
